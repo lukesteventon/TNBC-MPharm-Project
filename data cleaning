@@ -1,0 +1,46 @@
+---
+title: "Triple negative breast cancer - Laaeba MPharm"
+author: "Luke Steventon"
+date: "`r Sys.Date()`"
+output: html_document
+---
+```{r}
+setwd("/Users/luke/Documents/TNBC MPharm Project")
+table1<-read.csv("OFFICIAL_SENSITIVE_ODR1920_300_TABLE1_Pinkie_Chambers_15092022.csv")
+table2<-read.csv("OFFICIAL_SENSITIVE_ODR1920_300_TABLE2_Pinkie_Chambers_15092022.csv")
+table3<-read.csv("OFFICIAL_SENSITIVE_ODR1920_300_TABLE3_Pinkie_Chambers_15092022.csv")
+table4<-read.csv("OFFICIAL_SENSITIVE_ODR1920_300_TABLE4_Pinkie_Chambers_03102022.csv")
+```
+Firstly we need to join these tables together using the common pseudonymised ID:
+```{r}
+table12<-table1 %>% 
+  merge(table2, by = "PSEUDONYMISED_PATIENTID")
+```
+We need to identify triple negative patients. We will do this using ER_STATUS, PR_STATUS and HER2_STATUS:
+```{r}
+#These lines of code filter the table for patients who have ER, PR and HER2 status listed as N - negative.
+table12<-table12 %>% 
+  filter(ER_STATUS=="N") %>% 
+  filter(PR_STATUS=="N") %>% 
+  filter(HER2_STATUS=="N")
+
+table12 #n=1,720 patients who we know are triple negative.
+```
+We need to attach the date of surgery to each patient's record. Surgery information is contained in table 3.
+```{r}
+library(lubridate)
+table3<-table3 %>% 
+  filter(str_detect(EVENTDESC, "Surgery"))
+```
+Exclusion: we have agreed to define surgery related to chemotherapy as being performed within 6 months of the start of chemo. 
+We have checked the administration dates of the chemotherapy to confirm this was 1/1/2014. 
+Therefore we will exclude surgeries performed more than 6 months before 2014 as we do not consider these to be associated with the chemotherapy given after.
+```{r}
+table3<-table3 %>% 
+  mutate(EVENTDATE=lubridate::dmy(EVENTDATE)) %>% 
+  filter(EVENTDATE>"2013/07/01")
+#This step has excluded surgeries performed more than 6 months before the study period we are interested in.
+```
+Next steps:
+Consider how we handle patients who have multiple surgeries?
+Do we assume the surgery closest to their chemotherapy is the actual date of surgery, and not a biopsy date?
