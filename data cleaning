@@ -10,12 +10,31 @@ table1<-read.csv("OFFICIAL_SENSITIVE_ODR1920_300_TABLE1_Pinkie_Chambers_15092022
 table2<-read.csv("OFFICIAL_SENSITIVE_ODR1920_300_TABLE2_Pinkie_Chambers_15092022.csv")
 table3<-read.csv("OFFICIAL_SENSITIVE_ODR1920_300_TABLE3_Pinkie_Chambers_15092022.csv")
 table4<-read.csv("OFFICIAL_SENSITIVE_ODR1920_300_TABLE4_Pinkie_Chambers_03102022.csv")
+trust_codes<-read.csv("trust_codes.csv")
+
+library("tidyverse")
+library("lubridate")
+library("ggplot2")
+library("survminer")
+library(here)
+library(tableone)
+library(gtsummary)
+library(mice)
+library(VIM)
+library(survival)
+```
+
+Filter for breast cancer patients only:
+n=17,666 in total
+```{r}
+table2 %>%filter(str_detect(SITE_ICD10_O2, "C50")) %>%  count(PSEUDONYMISED_PATIENTID)
 ```
 Firstly we need to join these tables together using the common pseudonymised ID:
 ```{r}
 table12<-table1 %>% 
   merge(table2, by = "PSEUDONYMISED_PATIENTID")
 ```
+
 We need to identify triple negative patients. We will do this using ER_STATUS, PR_STATUS and HER2_STATUS:
 ```{r}
 #These lines of code filter the table for patients who have ER, PR and HER2 status listed as N - negative.
@@ -44,3 +63,326 @@ table3<-table3 %>%
 Next steps:
 Consider how we handle patients who have multiple surgeries?
 Do we assume the surgery closest to their chemotherapy is the actual date of surgery, and not a biopsy date?
+
+```{r}
+table4 %>% 
+  filter(str_detect(PRIMARY_DIAGNOSIS, "C50")) %>%
+  mutate(ADMINISTRATION_DATE=lubridate::dmy(ADMINISTRATION_DATE)) %>% 
+  arrange(desc(ADMINISTRATION_DATE))
+```
+
+Next steps:
+Consider how we handle patients who have multiple surgeries?
+
+This chunk of code attaches the surgery information to the list of triple negative patients. We can then exclude those who do not have a record of any surgery. 
+n=76 excluded here.
+n=1,644 total cohort at this stage
+```{r}
+triplenegativewithsurgery<-table12 %>% 
+  left_join(table3, by = "PSEUDONYMISED_TUMOURID") %>% 
+  select(PSEUDONYMISED_PATIENTID, PSEUDONYMISED_TUMOURID, EVENTDESC, EVENTDATE) %>% 
+  filter(!is.na(EVENTDESC))
+```
+
+Initial counts of surgical events:
+n=1,644 here
+```{r}
+triplenegativewithsurgery %>%
+  filter(EVENTDESC=="Surgery etc - type unknown") %>% 
+  count(PSEUDONYMISED_PATIENTID)
+```
+
+1. Do we delete non-curative??? (n = 513)
+- This code gives a list of patients who had an event of non curative surgery recorded. 
+- Data were checked, no patients had only a non-curative surgery recorded. All patients who had a non-curative surgery have at least one other surgical event recorded
+- Therefore we will not exclude any of these patients because they had other surgery recorded
+```{r}
+triplenegativewithsurgery %>% 
+  mutate(noncurative=ifelse(EVENTDESC=="Surgery - not curative",1,NA)) %>% 
+  group_by(PSEUDONYMISED_PATIENTID) %>% 
+  fill(noncurative,.direction = "updown") %>% 
+  filter(noncurative==1) %>% 
+  count(PSEUDONYMISED_PATIENTID) %>% 
+  filter(n<2)
+```
+
+2. What do we do with surgery unknown (n =7262)
+Here we filtered for surgery type - unknown and then filtered for patients who only have one surgery recorded.
+This filtered for n=306 patient who had one event of surgery which was unknown.
+```{r}
+triplenegativewithsurgery %>%
+  mutate(unknown=ifelse(EVENTDESC=="Surgery etc - type unknown",1,NA)) %>% 
+  group_by(PSEUDONYMISED_PATIENTID) %>% 
+  fill(unknown,.direction = "updown") %>% 
+  filter(unknown==1) %>% 
+  count(PSEUDONYMISED_PATIENTID) %>% 
+  filter(n==1) 
+
+triplenegativewithsurgery %>%
+  mutate(unknown=ifelse(EVENTDESC=="Surgery etc - type unknown",1,NA)) %>% 
+  group_by(PSEUDONYMISED_PATIENTID) %>% 
+  fill(unknown,.direction = "updown") %>% 
+  filter(unknown==1) %>% 
+  count(PSEUDONYMISED_PATIENTID)
+```
+
+3. How to handle `surgery first then chemo` or `chemo first then surgery` combinations.
+Firstly attach the surgery information to the chemo information. This creates a table with both surgery and drug administration dates.
+We can then sort this by date to start to look at the treatment timeline for patients.
+```{r}
+baselinecohort<- triplenegativewithsurgery %>% 
+  merge(table4, by= "PSEUDONYMISED_PATIENTID") %>% 
+  distinct(PSEUDONYMISED_PATIENTID, ANALYSIS_GROUP, ADMINISTRATION_DATE, DRUG_GROUP, EVENTDESC, EVENTDATE,.keep_all=T ) %>% 
+  arrange(PSEUDONYMISED_PATIENTID, EVENTDATE, START_DATE_OF_REGIMEN)
+
+baselinecohort %>% 
+  mutate(START_DATE_OF_REGIMEN=dmy(START_DATE_OF_REGIMEN)) %>% 
+  mutate(START_DATE_OF_CYCLE=dmy(START_DATE_OF_CYCLE)) %>% 
+  select(PSEUDONYMISED_PATIENTID, EVENTDESC, EVENTDATE, START_DATE_OF_REGIMEN, START_DATE_OF_CYCLE, DRUG_GROUP, ADMINISTRATION_DATE) %>% 
+  arrange(PSEUDONYMISED_PATIENTID,EVENTDATE, START_DATE_OF_REGIMEN, START_DATE_OF_CYCLE, ADMINISTRATION_DATE)
+```
+4.1 Filter out missing data
+```{r}
+baselinecohort %>% 
+  count(DRUG_GROUP) #this code counts the individual drugs that are given
+
+baselinecohort %>% 
+  count(PSEUDONYMISED_PATIENTID) #n =1,644 
+#We want to select only chemotherapy
+baselinecohort<-baselinecohort %>% 
+  filter(!is.na(DRUG_GROUP)) %>% 
+  filter(DRUG_GROUP!="")
+
+baselinecohort %>% 
+  count(PSEUDONYMISED_PATIENTID) #n=1,545. 99 patients have been excluded because of missing chemotherapy records
+```
+
+4.2 Filter out drugs that are not anti-cancer drugs.
+```{r}
+baselinecohort %>% 
+  count(PSEUDONYMISED_PATIENTID) #n=1,545 here
+
+baselinecohort<-baselinecohort %>% 
+  filter(DRUG_GROUP!="DEXAMETHASONE") %>% 
+  filter(DRUG_GROUP!="FLUCONAZOLE") %>% 
+  filter(DRUG_GROUP!="MULTIPLE") %>% 
+  filter(DRUG_GROUP!="NOT CHEMO") %>% 
+  filter(DRUG_GROUP!="NOT MATCHED") %>% 
+  filter(DRUG_GROUP!="STEROID") 
+
+baselinecohort %>% 
+  count(PSEUDONYMISED_PATIENTID) #n=1,524
+```
+
+Create conditions to select the correct surgery:
+1 -  When patient has more than one curative surgery, we will use the surgery closest to their next chemotherapy:
+Here we have excluded patients who did not have adjuvant treatment after their surgery.
+The cohort has reduced from 1,524 patients to 1,107. This means that 417 patients did not have a record of chemotherapy after their surgery.
+```{r}
+baselinecohort %>% 
+  count(PSEUDONYMISED_PATIENTID)
+
+surgeries<-baselinecohort %>% 
+  group_by(PSEUDONYMISED_PATIENTID) %>% 
+  distinct(PSEUDONYMISED_PATIENTID, EVENTDESC, EVENTDATE) %>% 
+  mutate(noncurativesurgery=ifelse(EVENTDESC=="Surgery - curative",1,NA)) %>% 
+  fill(noncurativesurgery, .direction = "updown") %>% 
+  mutate(noncurativesurgery=ifelse(EVENTDESC!="Surgery - curative", NA, noncurativesurgery)) %>% 
+  fill(noncurativesurgery, .direction = "updown")
+
+TTCtable<-surgeries %>% 
+  merge(baselinecohort, by= "PSEUDONYMISED_PATIENTID") %>% 
+  distinct(PSEUDONYMISED_PATIENTID, ADMINISTRATION_DATE, EVENTDESC.x,.keep_all=T) %>% 
+  mutate(ADMINISTRATION_DATE=dmy(ADMINISTRATION_DATE)) %>% 
+  mutate(TTC=difftime(ADMINISTRATION_DATE, EVENTDATE.x, units = "days")) %>% 
+  select(PSEUDONYMISED_PATIENTID,EVENTDATE.x,ADMINISTRATION_DATE, TTC, EVENTDESC.x) %>%
+  mutate(treatment=ifelse(TTC<0, "neoadjuvant", "adjuvant")) %>% 
+  group_by(PSEUDONYMISED_PATIENTID) %>% 
+  arrange(PSEUDONYMISED_PATIENTID, ADMINISTRATION_DATE) %>% 
+  group_by(PSEUDONYMISED_PATIENTID) %>% 
+  filter(TTC>0) %>% 
+  arrange(PSEUDONYMISED_PATIENTID,TTC) %>% 
+  distinct(PSEUDONYMISED_PATIENTID,.keep_all=T)
+
+TTCtable %>% count(PSEUDONYMISED_PATIENTID)
+```
+
+Final exclusion: 
+Here we will exclude patients where the time from surgery to chemo is over 180 days (6 months) as we have assumed this surgery is not related to the course of chemotherapy.
+
+```{r}
+TTCtable %>% 
+  count(PSEUDONYMISED_PATIENTID) #n=1,107 patients
+
+TTCtable<-TTCtable %>% 
+  filter(TTC<181)  #this removes patients who took more than 6 months. Filtered out 102 patients who had surgery more than 6 months before chemo
+  
+TTCtable %>% 
+  count(PSEUDONYMISED_PATIENTID) #n=1,005 patients 
+```
+Reattach ethnicity and regional information:
+```{r}
+baselinecohort<-table1 %>% 
+  select(PSEUDONYMISED_PATIENTID, ETHNICITYNAME) %>% 
+  merge(TTCtable, by = "PSEUDONYMISED_PATIENTID")
+
+trust_codes<-trust_codes %>% 
+  select(Commissioning.region, Code, DGH, Academic.hospital) %>% 
+  rename(ORGANISATION_CODE_OF_PROVIDER=Code)
+
+codes<-trust_codes %>% 
+  merge(table4, by = "ORGANISATION_CODE_OF_PROVIDER") %>% 
+  distinct(PSEUDONYMISED_PATIENTID,.keep_all=T) %>% 
+  select(PSEUDONYMISED_PATIENTID, Commissioning.region)
+
+```
+
+
+```{r}
+finaldatasetTNBC<-codes %>% 
+  right_join(baselinecohort, by = "PSEUDONYMISED_PATIENTID")
+
+finaldatasetTNBC<-table1 %>%
+  merge(table2, by = "PSEUDONYMISED_PATIENTID") %>% 
+  select(PSEUDONYMISED_PATIENTID, STAGE_BEST, CHRL_TOT_27_03, QUINTILE_2015) %>% 
+  merge(finaldatasetTNBC, by = "PSEUDONYMISED_PATIENTID") %>% 
+  distinct(PSEUDONYMISED_PATIENTID, .keep_all=T)
+```
+
+
+
+Calculate BMI at the start of treatment (baseline):
+```{r}
+table10<-table4 %>% 
+  mutate(BMI=(WEIGHT_AT_START_OF_REGIMEN/(HEIGHT_AT_START_OF_REGIMEN)^2)) %>%
+  group_by(PSEUDONYMISED_PATIENTID) %>% 
+  fill(BMI, .direction = "updown") 
+
+table10 %>% 
+  select(PSEUDONYMISED_PATIENTID, BMI, ADMINISTRATION_DATE, AGE_AT_FIRST_TREATMENT) %>% 
+ #mutate(ADMINISTRATION_DATE=dmy(ADMINISTRATION_DATE))
+  merge(finaldatasetTNBC, by = c("PSEUDONYMISED_PATIENTID", "ADMINISTRATION_DATE")) %>% 
+  distinct(PSEUDONYMISED_PATIENTID, .keep_all=T)
+
+table10 %>% 
+  select(PSEUDONYMISED_PATIENTID, BMI)
+```
+
+Calculate numbers of patients in each region
+```{r}
+library(tableone)
+libr
+finaldatasetTNBC %>% 
+  count(Commissioning.region)
+
+finaldatasetTNBC %>% 
+  count(CHRL_TOT_27_03)
+
+finaldatasetTNBC %>% 
+  mutate(TTC=as.numeric(TTC)) %>% 
+ distinct(PSEUDONYMISED_PATIENTID,.keep_all=T) %>% 
+  select(TTC, Commissioning.region, CHRL_TOT_27_03, QUINTILE_2015, ETHNICITYNAME2) %>% 
+ tbl_summary(by="Commissioning.region")
+
+finaldatasetTNBC %>% 
+  mutate(TTC=as.numeric(TTC)) %>% 
+ distinct(PSEUDONYMISED_PATIENTID,.keep_all=T) %>% 
+  select(TTC, Commissioning.region, CHRL_TOT_27_03, QUINTILE_2015, ETHNICITYNAME2) %>% 
+ tbl_summary(by="Commissioning.region")
+```
+Recode ethnicity:
+```{r}
+finaldatasetTNBC<-finaldatasetTNBC %>% 
+  mutate(ETHNICITYNAME2 = recode(ETHNICITYNAME,
+                                'ANY OTHER ASIAN BACKGROUND' = "Asian",
+                                'ASIAN BANGLADESHI' = "Asian",
+                                'ASIAN INDIAN' = "Asian",
+                                'ASIAN PAKISTANI' = "Asian",
+                                'ANY OTHER ASIAN BACKGROUND' = "Asian",
+                                'BLACK AFRICAN' = "Black",
+                                'BLACK CARIBBEAN' = "Black",
+                                'ANY OTHER BLACK BACKGROUND' = "Black",
+                                'MIXED WHITE AND ASIAN' = "Mixed Race",
+                                'ANY OTHER MIXED BACKGROUND' = "Mixed Race",
+                                'MIXED WHITE AND BLACK AFRICAN' = "Mixed Race",
+                                'MIXED WHITE AND BLACK CARIBBEAN' = "Mixed Race",
+                                'CHINESE' = "Chinese",
+                                'WHITE BRITISH' = "White",
+                                'WHITE IRISH' = "White",
+                                'ANY OTHER WHITE BACKGROUND' = "White",
+                                'NOT KNOWN' = "Unknown",
+                                'NOT STATED' = "Not stated",
+                                'ANY OTHER ETHNIC GROUP' = "Other",
+                                ))
+```
+
+Calculate age using treatment data:
+```{r}
+finaldatasetTNBC<-table4 %>% 
+  select(AGE_AT_FIRST_TREATMENT, PSEUDONYMISED_PATIENTID) %>% 
+  distinct(PSEUDONYMISED_PATIENTID,.keep_all=T) %>% 
+  merge(finaldatasetTNBC, by = "PSEUDONYMISED_PATIENTID")
+
+finaldatasetTNBC<-table1 %>% 
+  select(PSEUDONYMISED_PATIENTID, VITALSTATUS) %>% 
+  distinct(PSEUDONYMISED_PATIENTID,.keep_all=T) %>% 
+  merge(finaldatasetTNBC, by = "PSEUDONYMISED_PATIENTID")
+```
+
+Link BMI:
+```{r}
+finaldatasetTNBC<-table10 %>% 
+  select(PSEUDONYMISED_PATIENTID, BMI) %>% 
+   distinct(PSEUDONYMISED_PATIENTID,.keep_all=T) %>% 
+  merge(finaldatasetTNBC, by = "PSEUDONYMISED_PATIENTID")
+
+finaldatasetTNBC<-finaldatasetTNBC %>% 
+ mutate(BMI=ifelse(BMI>100,NA,BMI))
+
+finaldatasetTNBC<-finaldatasetTNBC %>% 
+  mutate(BMI=ifelse(BMI=="Inf",NA,BMI))
+
+```
+Creating some summary tables:
+```{r}
+library(gtsummary)
+
+finaldatasetTNBC %>% 
+  select(TTC,VITALSTATUS, AGE_AT_FIRST_TREATMENT,BMI, Commissioning.region, STAGE_BEST,QUINTILE_2015,ETHNICITYNAME2, CHRL_TOT_27_03)  %>% 
+  tbl_summary() %>% 
+  add_n()
+
+finaldatasetTNBC %>% 
+  select(TTC,VITALSTATUS, AGE_AT_FIRST_TREATMENT,BMI,Commissioning.region, STAGE_BEST,QUINTILE_2015,ETHNICITYNAME2, CHRL_TOT_27_03)  %>% 
+  tbl_summary(by = "Commissioning.region") %>% 
+     add_p()
+```
+
+Create a graph plotting BMI against TTC:
+```{r}
+BMI_chart<-
+  finaldatasetTNBC %>%
+  select(BMI, TTC) %>% 
+  mutate(TTC=as.numeric(TTC))
+
+BMI_chart %>% 
+  ggplot(aes(x=BMI, y=TTC))+
+   geom_smooth(method='lm', formula= y~x)
+```
+
+
+
+```{r}
+two.way <- aov(TTC ~ ETHNICITYNAME2, data = finaldatasetTNBC)
+
+summary(two.way)
+```
+
+Logistic regression of patient factors on TTC:
+```{r}
+model<-glm(DELAYED_FLAG~ETHNICITYNAME+REGIMEN+STAGE_BEST+hormone_NEG_HER2_POS+hormone_POS_HER2_NEG+hormone_POS_HER2_POS+unknown_hist+TRIPLENEG+SURGERY_BEFORE_C1+SURGERY_AFTER_SACT+CENTRE_TYPE+Commissioning.region+AGE_AT_FIRST_TREATMENT_2, data= KM_curve)
+summary(model)
+
+anova(model)
+```
+
